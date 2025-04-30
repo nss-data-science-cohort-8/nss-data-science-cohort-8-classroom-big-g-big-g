@@ -7,7 +7,7 @@ faults = pd.read_csv("data/J1939Faults.csv")
 diagnostics = pd.read_csv("data/VehicleDiagnosticOnboardData.csv").pivot(index='FaultId', columns='Name', values='Value') # Immediately pivot diagnostic data on FaultId to then be merged
 faults_and_diagnostics = faults.merge(diagnostics, how='left', left_on='RecordID', right_on='FaultId')
 
-def remove_service_locations(df, radius=0.05):
+def remove_service_locations(df, radius=.05):
     """
     Remove data points that are near service locations.
     """
@@ -18,14 +18,14 @@ def remove_service_locations(df, radius=0.05):
         'Location3': (36.1950, -83.174722) 
     }
 
-    # Calculate distance to each service location and filter out points within a certain radius (e.g., 5 km)
+    # Calculate distance to each service location and filter out points within a certain radius
     for loc, coords in service_locations.items():
         df['DistanceTo' + loc] = np.sqrt((df['Latitude'] - coords[0])**2 + (df['Longitude'] - coords[1])**2)
-        df = df[df['DistanceTo' + loc] > radius]  # Filter out points within 5 km (radius)
+        df = df[df['DistanceTo' + loc] > radius] 
 
     return df
 
-def create_target_cols(df):
+def create_target_cols(df, time_limit=2):
     """
     Create target columns for the dataset.
     """
@@ -42,43 +42,58 @@ def create_target_cols(df):
     df['HoursUntilNextDerate'] = (df['NextDerateTime'] - df['EventTimeStamp']).dt.total_seconds() / 3600.0
     df['DerateInNextTwoHours'] = np.where(df['HoursUntilNextDerate'] <= 2, 1, 0)
 
-    return df
+    # throw out anything after a derate for a short amount of time
+    def remove_after_derate(df, time_limit=time_limit):
+        """
+        Remove data points that are after a derate for a certain time limit.
+        """
+        df['PrevDerateTime'] = df.where(df['FullDerate'] == 1)['EventTimeStamp']
+        df['PrevDerateTime'] = df.groupby('EquipmentID')['PrevDerateTime'].transform('ffill')
 
-# Convert diagnostic columns to appropriate dtypes
-for col, dtype in {
-    "AcceleratorPedal":"float16",
-    "BarometricPressure":"float16",
-    "CruiseControlActive":"bool",
-    "CruiseControlSetSpeed":"float16",
-    "DistanceLtd":"float16",
-    "EngineCoolantTemperature":"float16",
-    "EngineLoad":"float16",
-    "EngineOilPressure":"float16",
-    "EngineOilTemperature":"float16",
-    "EngineRpm":"float16",
-    "EngineTimeLtd":"float16",
-    "FuelLevel":"float16",
-    "FuelLtd":"float32",
-    "FuelRate":"float16",
-    "FuelTemperature":"float16",
-    "IgnStatus":"bool",
-    "IntakeManifoldTemperature":"float16",
-    "ParkingBrake":"bool",
-    "Speed":"float16",
-    "SwitchedBatteryVoltage":"float16",
-    "Throttle":"float16",
-    "TurboBoostPressure":"float16",
-    "eventDescription":"str",
-    "EquipmentID":"str"
-}.items():
-    if dtype == 'bool':
-        faults_and_diagnostics[col] = faults_and_diagnostics[col].astype('bool')
-    else:
-        faults_and_diagnostics[col] = pd.to_numeric(faults_and_diagnostics[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        # Calculate the time difference from the last derate
+        df['TimeAfterDerate'] = (df['EventTimeStamp'] - df['PrevDerateTime']).dt.total_seconds() / 3600.0
 
-# throw out anything after a derate for a short amount of time
+        # Filter out rows where TimeAfterDerate is less than the time limit while keeping rows if no derate occurs for that truck
+        df = df[df['TimeAfterDerate'].isna() | (df['TimeAfterDerate'] > time_limit)]
 
-# throw out data nearby service locations
+        return df.drop(columns=['PrevDerateTime', 'TimeAfterDerate'])
+
+    return remove_after_derate(df)
+
+def convert_diagnostic_cols_to_numeric(df):
+    # Convert diagnostic columns to appropriate dtypes
+    for col, dtype in {
+        "AcceleratorPedal":"float16",
+        "BarometricPressure":"float16",
+        "CruiseControlActive":"bool",
+        "CruiseControlSetSpeed":"float16",
+        "DistanceLtd":"float16",
+        "EngineCoolantTemperature":"float16",
+        "EngineLoad":"float16",
+        "EngineOilPressure":"float16",
+        "EngineOilTemperature":"float16",
+        "EngineRpm":"float16",
+        "EngineTimeLtd":"float16",
+        "FuelLevel":"float16",
+        "FuelLtd":"float32",
+        "FuelRate":"float16",
+        "FuelTemperature":"float16",
+        "IgnStatus":"bool",
+        "IntakeManifoldTemperature":"float16",
+        "ParkingBrake":"bool",
+        "Speed":"float16",
+        "SwitchedBatteryVoltage":"float16",
+        "Throttle":"float16",
+        "TurboBoostPressure":"float16",
+        "eventDescription":"str",
+        "EquipmentID":"str"
+    }.items():
+        if dtype == 'bool':
+            df[col] = df[col].astype('bool')
+        else:
+            df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        
+        return df
 
 def ffill_nans(df): # alternatively try interpolation, moving averages, KNeighbors
     """
@@ -91,6 +106,7 @@ def ffill_nans(df): # alternatively try interpolation, moving averages, KNeighbo
 
     return df.groupby('EquipmentID', group_keys=False).apply(fill_group)
 
+faults_and_diagnostics = convert_diagnostic_cols_to_numeric(faults_and_diagnostics)
 # Separate training and testing data based on before and after 2019-01-01
 faults_and_diagnostics_train = ffill_nans(create_target_cols(remove_service_locations(faults_and_diagnostics[faults_and_diagnostics['EventTimeStamp']<'2019-01-01'])))
 faults_and_diagnostics_test = ffill_nans(create_target_cols(remove_service_locations(faults_and_diagnostics[(faults_and_diagnostics['EventTimeStamp']>='2019-01-01') & (faults_and_diagnostics['EventTimeStamp']<='2024-01-01')])))
